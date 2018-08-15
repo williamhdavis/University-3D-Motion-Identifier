@@ -1,0 +1,525 @@
+#!/usr/bin/env python
+
+"""
+///////////////////////////////////////////////////////////////////////////
+//  scanner -- A python program to detect non linear moving objects in   //
+//             stereo imagery.                                           //
+///////////////////////////////////////////////////////////////////////////
+
+Purpose:
+This program is used to analyse a series of frames of stereo pair images 
+to detect object motion in a three dimensional space created by combining 
+each stereo pair. Reporting to the user when objects with nonlinear motion 
+are detected. To do so, it first scans over each pair of images to find 
+any objects using contour detection. Finding the centre point for each 
+object detected.
+
+Each list of centre points is then sorted to make later processes more 
+efficient by reducing the number of cycles required in the average case. 
+Then the data is scanned to detect the maximum number of objects detected 
+on any single frame before the full data set is filtered so that only 
+frames where the full set of objects were detected are retained for later 
+processing.
+
+At this point, the individual stereo frames are combined to produce a set 
+of absolute coordinates in three dimensional space for each frame in the 
+sequence before finally the full set is analysed to remove any points 
+that are part of a linear motion through the full sequence. When performed 
+correctly, this leaves only the points that make up nonlinear paths which 
+completes the programs function.
+
+Usage:
+./scanner <PathToImages>    OR    python scanner <PathToImages>
+Where <PathToImages> is a folder containing an equal number of left and
+right images to be scanned through.
+eg: "./scanner data/images"    OR    "./scanner data/images/"
+
+///////////////////////////////////////////////////////////////////////////
+
+Report:
+To analyse the motion of objects detected within a series of frames in the
+form of stereo images, the task was broken down into a series of steps to
+simplify the process. The first of these steps was to differentiate the
+images for the left side of the stereo pair from the images for the right
+side. This is achieved by filtering a directory by file name where the file
+name either contains "left" or "right". Also in this step, the number of
+images detected is checked to ensure that they both contain the same number.
+
+The next main step is locating the position of every object on each frame
+of the stereo sequence and saving these values as coordinate pairs. This is
+implemented through contour detection in OpenCV which allows the individual
+objects to be easily picked out and their centres located. At this point,
+all the points are scanned through for both left and right images to fix
+errors in the stereo positioning of the y-axis as in each image pair, the
+y-axis coordinate of each object should be the same but is sometimes
+detected as slightly different values.
+
+Next, the lists are able to be sorted such that the objects are arranged
+on each frame ordered first by their y-axis coordinate and then their
+x-axis coordinate. This ensures that the objects will be in the same order
+when they are combined to make a three dimensional depth map. Then, the
+largest number of objects to be detected on any single frame is recorded
+and the data set filtered to remove any frames that don't contain the full
+list of objects. This is done to ensure that objects are matched correctly
+without the issue of detecting when an object has left the frame. This
+process also removes any entries where the centre point was not accurately
+detected.
+
+Penultimately, the coordinate systems of each frame are adjusted so that
+the coordinate (0, 0) lies in the middle of each image rather than the top
+left and then the object coordinates are combined. This combination process
+requires the actual size of each pixel to be considered such that the units
+of each element of the equations are the same. This process results in an
+absolute coordinate for each object per frame in three dimensions.
+
+Finally, each coordinate in the first frame is paired to every object in all
+the remaining frames to create a series of vectors which are normalised. The
+dimensions of these vectors are then compared and where they are within a
+similarity tolerance, they are declared as a linear path and the coordinates
+that make up that path are removed from the data set. This results in only
+coordinates that make up nonlinear paths being left at the end of the
+program which is used to output the result to the user.
+
+Looking over the images, it is clear that there is a single object with a
+nonlinear motion, and this is what the program declares as well, as such,
+the program is considered to be a success in detecting nonlinear motion. The
+program runs bug free as desired and is capable of declaring that there are
+no objects with nonlinear motion or announcing how many objects have
+nonlinear motion if there are any in the frames. By tweaking the linear
+tolerance variable, the similarity required to declare any two vectors as
+linear, can be changed. In the case of the paths for the objects in the
+provided image sequence, the used value of 0.0001 produces the expected
+result while allowing for the small errors that are to be expected.
+
+///////////////////////////////////////////////////////////////////////////
+"""
+
+# Required libraries for the correct functionality of scanner.
+import glob, cv2, sys, pylab, math
+
+# DEBUG defines if the program is in debug mode or running mode.
+DEBUG = False
+
+# IMAGE_LEFT_TAG is used to specify the part of the image filenames that
+#     specifies that that image is for the left side of the stereo frame.
+IMAGE_LEFT_TAG = "left-"
+# IMAGE_RIGHT_TAG is used to specify the part of the image filenames that
+#     specifies that that image is for the right side of the stereo frame.
+IMAGE_RIGHT_TAG = "right-"
+# IMAGE_FORMAT is used to define the file format of the input files.
+IMAGE_FORMAT = ".png"
+
+# FOCAL_LENGTH is used to specify the focal length of the camera that
+#     took the images. It is in meters.
+FOCAL_LENGTH = 12
+# DISPLACEMENT is used to specify the distance between the two cameras
+#     used for the images. It is in meters.
+DISPLACEMENT = 3500
+# PIXEL_SPACING is used to specify the actual distance represented by a
+#     single pixel in the image. It is in meters.
+PIXEL_SPACING = 0.00001
+
+# LINEAR_TOLLERANCE is used to specify the error allowed on each axis of
+#     the linear path where it is still classified as liner. It is in meters.
+LINEAR_TOLLERANCE = 0.0001
+
+def getCenters(image):
+	"""
+	"getCenters" is used to get the centre point of each object found
+	    within a given image.
+	@param image - Image. An input image to be scanned for objects.
+	@return - List(Tuple(Integer)). A list containing the centre points of
+	    the found objects as tuple pairs of integers.
+	"""
+	out = []
+	ret, thresh = cv2.threshold(image, 1, 255, cv2.THRESH_BINARY)
+	im, contour, hier = cv2.findContours(thresh, cv2.RETR_LIST, \
+	            cv2.CHAIN_APPROX_SIMPLE)
+	i = 0
+	while(i < len(contour)):
+		moment = cv2.moments(contour[i])
+		x, y = -1, -1
+		if(moment['m00'] != 0):
+			x = int(moment['m10'] / moment['m00'])
+			y = int(moment['m01'] / moment['m00'])
+		out.append((x, y))
+		i += 1
+	return out
+	
+def getAllCenters(left, right):
+	"""
+	"getAllCenters" is used to find all the centre points of the objects
+	    found on each left and right image.
+	@param left - List(String). Strings that define the location of each
+	    left image.
+	@param right - List(String). Strings that define the location of each
+	    right image.
+	@return - Tuple(List(List(Tuple(Integer)))). All the centre points of the
+	    found objects in a structure of lists for each frame.
+	"""
+	leftCenters = []
+	rightCenters = []
+	i = 0
+	while(i < len(left)):
+		centersLeft = getCenters(cv2.imread(left[i], 0))
+		centersRight = getCenters(cv2.imread(right[i], 0))
+		leftCenters.append(centersLeft)
+		rightCenters.append(centersRight)
+		i += 1
+	return (leftCenters, rightCenters)
+		
+def getMaxLength(leftCenters, rightCenters):
+	"""
+	"getMaxLength" is used to find the length of the longest list within the
+	    data structure. This is equivalent to the most objects found in a
+		single image.
+	@param leftCenters - List(List(Tuple(Integer)). A list of frames, each
+	    with a list of object centre points.
+	@param rightCenters - List(List(Tuple(Integer)). A list of frames, each
+	    with a list of object centre points.
+	@return - Integer. The most objects found in any single image.
+	"""
+	max = len(leftCenters[0])
+	i = 0
+	while(i < len(leftCenters)):
+		if(len(leftCenters[i]) > max):
+			max = len(leftCenters[i])
+		if(len(rightCenters[i]) > max):
+			max = len(rightCenters[i])
+		i += 1
+	return max
+	
+def sorter(a, b):
+	"""
+	"sorter" is used to define a sorting rule set for coordinates.
+	@param a - The first coordinate to be sorted.
+	@param b - The second coordinate to be sorted.
+	@return - Integer. The order value for the two coordinates.
+	"""
+	if(a[1] > b[1]):
+		return 1
+	elif(a[1] == b[1]):
+		if(a[0] > b[0]):
+			return 1
+		elif(a[0] == b[0]):
+			return 0
+		else:
+			return -1
+	else:
+		return -1
+	
+def sortCenter(centers):
+	"""
+	"sortCenter" is used to sort the centre values into ascending order by
+	    their y coordinate then their x coordinate.
+	@param centers - List(List(Tuple(Integer))). The object centres in a
+	    list for each frame in a list.
+	"""
+	i = 0
+	while(i < len(centers)):
+		centers[i].sort(sorter)
+		i += 1
+		
+def fixY(leftCenters, rightCenters):
+	"""
+	"fixY" is used to fix any y values that are slightly off between the
+	    left and right image as these should be the same.
+	@param leftCenters - List(List(Tuple(Integer))). The object centres in
+	    a list for each frame of the left camera.
+	@param rightCenters - List(List(Tuple(Integer))). The object centres in
+	    a list for each frame of the right camera.
+	"""
+	i = 0
+	while(i < len(leftCenters)):
+		j = 0
+		while(j < len(leftCenters[i])):
+			if(leftCenters[i][j][1] != rightCenters[i][j][1]):
+				rightCenters[i][j] = (rightCenters[i][j][0], \
+				            leftCenters[i][j][1])
+			j += 1
+		i += 1
+	
+def removeFaults(leftCenters, rightCenters, maxLength):
+	"""
+	"removeFaults" is used to remove any frames that do not show all the
+	    detected objects or that have an error in the centre point
+		detection.
+	@param leftCenters - List(List(Tuple(Integer))). The object centres in
+	    a list for each frame of the left camera.
+	@param rightCenters - List(List(Tuple(Integer))). The object centres in
+	    a list for each frame of the right camera.
+	@param maxLength - Integer. The largest number of objects detected.
+	@return - Tuple(List(List(Tuple(Integer)))). Each object detected on each
+	    frame from both cameras where each frame has detected all the objects.
+	"""
+	outLeft = []
+	outRight = []
+	i = 0
+	while(i < len(leftCenters)):
+		if(len(leftCenters[i]) == maxLength and len(rightCenters[i]) == \
+		            maxLength):
+			check = True
+			j = 0
+			while(j < len(leftCenters[i]) and check):
+				if(leftCenters[i][j][0] == -1 or leftCenters[i][j][1] \
+				            == -1 or rightCenters[i][j][0] == -1 or \
+				            rightCenters[i][j][1] == -1):
+					check = False
+				j += 1
+			if(check):
+				outLeft.append(leftCenters[i])
+				outRight.append(rightCenters[i])
+		i += 1
+	return (outLeft, outRight)
+	
+def adjustCoords(centers, imageWidth, imageHeight):
+	"""
+	"adjustCoords" is used to alter all the coordinated within a list
+	    of centres based on the image width.
+	@param centers - List(List(Tuple(Integer))). All the centres within
+	    a list of frames.
+	@param imageWidth - Integer. The width of each image.
+	@param imageHeight - Integer. The height of each image.
+	"""
+	xOff = imageWidth / 2
+	yOff = imageHeight / 2
+	i = 0
+	while(i < len(centers)):
+		j = 0
+		while(j < len(centers[i])):
+			nX = centers[i][j][0] - xOff
+			nY = yOff - centers[i][j][1]
+			centers[i][j] = (nX, nY)
+			j += 1
+		i += 1
+	
+def combineCenters(leftCenters, rightCenters):
+	"""
+	"combineCenters" is used to merge the points in the two lists of frames
+	    into a single list with coordinates in three dimensions.
+	@param leftCenters - List(List(Tuple(Integer))). The object centres in
+	    a list for each frame of the left camera.
+	@param rightCenters - List(List(Tuple(Integer))). The object centres in
+	    a list for each frame of the right camera.
+	@return - List(List(Tuple(Float))). The list of combined points for
+	    each frame.
+	"""
+	out = []
+	i = 0
+	while(i < len(leftCenters)):
+		preOut = []
+		j = 0
+		while(j < len(leftCenters[i])):
+			xDif = (leftCenters[i][j][0] - rightCenters[i][j][0]) * \
+			        PIXEL_SPACING
+			z = int((FOCAL_LENGTH * DISPLACEMENT) / xDif)
+			x = int(((rightCenters[i][j][0] * -1 * PIXEL_SPACING) / \
+			        FOCAL_LENGTH) * z)
+			y = round(leftCenters[i][j][1] * PIXEL_SPACING, 4)
+			preOut.append((x, y, z))
+			j += 1
+		out.append(preOut)
+		i += 1
+	return out
+	
+def getVector(first, second):
+	"""
+	"getVectors" is used to create a vector between two points in three
+	    dimensions.
+	@param first - Tuple(Float). The first point.
+	@param second - Tuple(Float). The second point.
+	@return - Tuple(Float). The vector between the points.
+	"""
+	return (second[0] - first[0], second[1] - first[1], second[2] - first[2])
+	
+def getVectorMagnitude(vector):
+	"""
+	"getVectorMagnitude" is used to get the magnitude of a three dimensional
+	    vector.
+	@param vector - Tuple(Float). The three dimensional vector.
+	@return - Float. The magnitude of the vector.
+	"""
+	return abs(math.sqrt(vector[0] * vector[0] + vector[1] * vector[1] + \
+	            vector[2] * vector[2]))
+	
+def getNormalisedVector(vector):
+	"""
+	"getNormalisedVector" is used to get a normalised version of a vector.
+	@param vector - Tuple(Float). A three dimensional vector.
+	@return - Tuple(Float). A normalised three dimensional vector.
+	"""
+	mag = getVectorMagnitude(vector)
+	x = vector[0] / mag
+	y = vector[1] / mag
+	z = vector[2] / mag
+	return (x, y, z)
+	
+def vectorCompare(v1, v2):
+	"""
+	"vectorCompare" is used to compare two normalised vectors to determine
+	    if they are similar enough to be declared linear.
+	@param v1 - Tuple(Float). The first vector.
+	@param v2 - Tuple(Float). The second vector.
+	@return - Boolean. If the vectors have been declared linear.
+	"""
+	x = abs(v1[0] - v2[0]) < LINEAR_TOLLERANCE
+	y = abs(v1[1] - v2[1]) < LINEAR_TOLLERANCE
+	z = abs(v1[2] - v2[2]) < LINEAR_TOLLERANCE
+	return (x and y and z)
+	
+def createVectors(start, centers):
+	"""
+	"createVectors" is used to generate a list of vectors between a starting
+	    point and a list of end points.
+	@param start - Tuple(Float). The starting point.
+	@param centers - List(Tuple(Float)). The list of end points.
+	@return - List(Tuple(Float)). The list of vectors.
+	"""
+	out = []
+	i = 0
+	while(i < len(centers)):
+		out.append(getNormalisedVector(getVector(start, centers[i])))
+		i += 1
+	return out
+	
+def findMatch(vector, centerVectors):
+	"""
+	"findMatch" is used to check if a normalised vector is linear with one of
+	    the vectors in a list of vectors.
+	@param vector - Tuple(Float). The vector to compare with.
+	@param centerVectors - List(Tuple(Float)). The list of vectors to be
+	    compared against.
+	@return - Integer. The position of the matching vector or minus one if no
+	    match was found.
+	"""
+	i = 0
+	while(i < len(centerVectors)):
+		if(vectorCompare(vector, centerVectors[i])):
+			return i
+		i += 1
+	return -1
+	
+def removeLinear(centers):
+	"""
+	"removeLinear" is used to remove any data that is part of a linear path in
+	    three dimensional space. Leaving only nonlinear data.
+	@param centers - List(List(Tuple(Float))). The points per frame that should
+	    be searched for linear paths with the linear paths being removed.
+	"""
+	i = 0
+	while(i < len(centers[0])):
+		start = centers[0][i]
+		startVectors = createVectors(start, centers[1])
+		check = True
+		j = 0
+		while(j < len(startVectors) and check):
+			pathCheck = True
+			posStore = []
+			k = 2
+			while(k < len(centers) and pathCheck):
+				pos = findMatch(startVectors[j], createVectors( \
+				            start, centers[k]))
+				if(pos == -1):
+					pathCheck = False
+				else:
+					posStore.append(pos)
+				k += 1
+			if(pathCheck):
+				centers[0].remove(centers[0][i])
+				centers[1].remove(centers[1][j])
+				l = 0
+				while(l < len(posStore)):
+					centers[l + 2].remove(centers[l + 2] \
+					            [posStore[l]])
+					l += 1
+				check = False
+				i -= 1
+			j += 1
+		i += 1
+
+# Ensure that there is exactly one folder specified for analysis.
+#     Otherwise abort.
+if(len(sys.argv) != 2):
+	print >> sys.stderr, "Usage: " + sys.argv[0] + " <pathToImages>"
+	print >> sys.stderr, "   eg: " + sys.argv[0] + " images"
+	sys.exit(1)
+
+# Get all the image file names within the specified folder that matches
+#     the specified format. Stop if no images are found.
+slash = "/"
+if(sys.argv[1][len(sys.argv[1]) - 1] == "/"):
+	slash = ""
+left = glob.glob(sys.argv[1] + slash + IMAGE_LEFT_TAG + '*' + IMAGE_FORMAT)
+right = glob.glob(sys.argv[1] + slash + IMAGE_RIGHT_TAG + '*' + IMAGE_FORMAT)
+if(len(left) < 1 or len(right) < 1):
+	print >> sys.stderr, "No images found in folder. Please check folder path."
+	sys.exit(1)
+
+# Check there are the same number of left and right images. If not, abort.
+if(len(left) != len(right)):
+	print >> sys.stderr, "Error: Folder specified does not contain an " + \
+	            "equal number of images for each side. There are:"
+	print >> sys.stderr, "    Left: " + str(len(left))
+	print >> sys.stderr, "    Right: " + str(len(right))
+	sys.exit(1)
+	
+# Get the dimensions of the first image.
+imY, imX = cv2.imread(left[0], 0).shape
+	
+# Run through each image for left and right and load the location of each
+#     found object into lists.
+leftCenters, rightCenters = getAllCenters(left, right)
+
+# Alter the y-values in the right images list so that they match the
+#    x-values where errors in reading the objects locations have occurred.
+fixY(leftCenters, rightCenters)
+
+# Sort the lists of points so that matching should be simpler.
+sortCenter(leftCenters)
+sortCenter(rightCenters)
+
+# Find the most objects detected in any image.
+maxLength = getMaxLength(leftCenters, rightCenters)
+
+# Filter out any entries that don't have the full number of objects detected
+#     or where there is an error in a position.
+leftCenters, rightCenters = removeFaults(leftCenters, rightCenters, maxLength)
+
+# Alter all the point values such that they are centred on the mid-point
+#     of the image they are from.
+adjustCoords(leftCenters, imX, imY)
+adjustCoords(rightCenters, imX, imY)
+
+# Merge the left and right points to get a single list of points.
+centers = combineCenters(leftCenters, rightCenters)
+
+#Remove any points that are part of linear paths.
+removeLinear(centers)
+
+# If debugging is enabled, print the raw data to the screen.
+if(DEBUG):
+	i = 0
+	while(i < len(leftCenters)):
+		print(centers[i])
+		print
+		i += 1
+
+# Count the number of nonlinear moving objects that have been detected
+#     and inform the user.		
+count = len(centers[0])
+if(count > 0):
+	s = "s"
+	are = "are "
+	if(count == 1):
+		s = ""
+		are = "is "
+	print("Aliens detected! There " + are + str(count) + " ship" + \
+	            s + " in the captured frames.")
+else:
+	print("No aliens detected.")
+	
+"""
+///////////////////////////////////////////////////////////////////////////
+//  scanner  --  End of scanner.                                         //
+///////////////////////////////////////////////////////////////////////////
+"""
